@@ -5,6 +5,10 @@ set -euo pipefail
 
 echo "Starting SSH container..."
 
+# Ensure runtime dirs exist (tmpfs may override image contents)
+mkdir -p /run/sshd /var/run/sshd
+chmod 755 /run/sshd /var/run/sshd
+
 # Create users from USERS env before starting sshd (idempotent)
 if [ -n "${USERS:-}" ]; then
     echo "Creating users from USERS environment variable..."

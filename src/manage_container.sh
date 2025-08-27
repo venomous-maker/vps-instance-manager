@@ -268,7 +268,7 @@ compose_up_all() {
     [ -z "$u" ] && continue
     ensure_storage "$u" "${storage_v:-}"
   done < "$USERS_CSV"
-  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d )
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d --build )
 }
 
 service_exists() {
@@ -297,7 +297,7 @@ start_container() {
       echo "Error: service '$svc' not found in $GEN_COMPOSE. Check users.csv and regenerate." >&2
       exit 1
     fi
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d -- "$svc" )
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d --build -- "$svc" )
 }
 
 stop_container() {
@@ -335,7 +335,7 @@ recreate_container() {
       echo "Error: service '$svc' not found in compose config" >&2
       exit 1
     fi
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d --force-recreate --no-deps -- "$svc" )
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d --build --force-recreate --no-deps -- "$svc" )
 }
 
 show_logs() {
