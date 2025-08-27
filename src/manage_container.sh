@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
 GEN_COMPOSE="$SCRIPT_DIR/docker-compose.generated.yml"
 USERS_CSV="$SCRIPT_DIR/users.csv"
 STORAGE_DIR="$SCRIPT_DIR/storage"
+LXCFS_PROC_DIR="/var/lib/lxcfs/proc"
 
 # Detect compose command
 compose_cmd() {
@@ -59,7 +60,7 @@ Usage: $0 COMMAND [ARGS]
 Commands:
   generate                          Generate $GEN_COMPOSE from $USERS_CSV (self-contained)
   up                                Generate and start all defined user containers
-  add <user> [ssh web pass cpus mem storage]
+  add <user> [ssh web pass cpus mem storage cpuset]
                                     Add/update a user row in users.csv and up just that service
   remove <user>                     Stop and remove a user's service and volume; delete from users.csv
   start <user>                      Start a specific user's container
@@ -77,11 +78,12 @@ Commands:
   help                              Show this help
 
 CSV format (backward compatible):
-  user,ssh_port,web_port,password,cpus,memory,storage
+  user,ssh_port,web_port,password,cpus,memory,storage,cpuset
   - cpus: number of CPU cores (e.g. 0.5, 1, 2)
   - memory: RAM limit (e.g. 512m, 1g)
   - storage: persistent home size (e.g. 5G, 20G). Creates a loopback ext4 volume mounted to /home
-Example: alice,2222,8001,mysecret,1,512m,10G
+  - cpuset: CPU set mask (e.g. 0-1 or 0,2)
+Example: alice,2222,8001,mysecret,1,512m,10G,0-1
 EOF
 }
 
@@ -100,7 +102,7 @@ get_ssh_port() {
 
 ensure_users_csv() {
   if [ ! -f "$USERS_CSV" ]; then
-    echo "user,ssh_port,web_port,password,cpus,memory,storage" > "$USERS_CSV"
+    echo "user,ssh_port,web_port,password,cpus,memory,storage,cpuset" > "$USERS_CSV"
   fi
 }
 
@@ -168,9 +170,9 @@ generate_compose() {
     echo "# Source CSV: $(basename "$USERS_CSV")"
     echo "services:"
     # Use distinct local variables to avoid clobbering outer scope
-    local u ssh_p web_p pass cpus_v mem_v storage_v
+    local u ssh_p web_p pass cpus_v mem_v storage_v cpuset_v
     # shellcheck disable=SC2162
-    while IFS=, read -r u ssh_p web_p pass cpus_v mem_v storage_v; do
+    while IFS=, read -r u ssh_p web_p pass cpus_v mem_v storage_v cpuset_v; do
       # skip header or comments/blank
       [ -z "${u:-}" ] && continue
       case "$u" in \
@@ -185,6 +187,7 @@ generate_compose() {
       cpus_v=${cpus_v:-}
       mem_v=${mem_v:-}
       storage_v=${storage_v:-}
+      cpuset_v=${cpuset_v:-}
       [ -z "$pass" ] && pass=$(gen_password)
       # service
       echo "  ${u}-ssh:"
@@ -195,13 +198,19 @@ generate_compose() {
       echo "    labels:"
       echo "      - managed-by=manage_container.sh"
       echo "      - user=${u}"
-      # Removed no-new-privileges to allow sudo within the container
       echo "    tmpfs: [ \"/tmp:rw,noexec,nosuid\", \"/run:rw\", \"/var/run:rw\" ]"
       echo "    volumes:"
       if [ -n "$storage_v" ]; then
         echo "      - ./storage/${u}:/home"
       else
         echo "      - ${u}-data:/home"
+      fi
+      # LXCFS binds if present on host (to reflect limits inside /proc)
+      if [ -d "$LXCFS_PROC_DIR" ]; then
+        echo "      - $LXCFS_PROC_DIR/meminfo:/proc/meminfo:ro"
+        echo "      - $LXCFS_PROC_DIR/cpuinfo:/proc/cpuinfo:ro"
+        echo "      - $LXCFS_PROC_DIR/stat:/proc/stat:ro"
+        echo "      - $LXCFS_PROC_DIR/diskstats:/proc/diskstats:ro"
       fi
       echo "    environment:"
       echo "      - USERS=${u}:${pass}"
@@ -215,6 +224,9 @@ generate_compose() {
       # Resource limits
       if [ -n "$cpus_v" ]; then
         echo "    cpus: \"$cpus_v\""
+      fi
+      if [ -n "$cpuset_v" ]; then
+        echo "    cpuset: \"$cpuset_v\""
       fi
       if [ -n "$mem_v" ]; then
         echo "    mem_limit: \"$mem_v\""
@@ -237,8 +249,8 @@ generate_compose() {
     done < "$USERS_CSV"
     echo "volumes:"
     # shellcheck disable=SC2162
-    local uv sv wv pv cv mv storv
-    while IFS=, read -r uv sv wv pv cv mv storv; do
+    local uv sv wv pv cv mv storv cpv
+    while IFS=, read -r uv sv wv pv cv mv storv cpv; do
       [ -z "${uv:-}" ] && continue
       case "$uv" in \
         \#*|user) continue;; \
@@ -451,9 +463,10 @@ doctor() {
   fi
 }
 
+# CSV upsert now supports cpuset as 8th field
 csv_upsert_user() {
   ensure_users_csv
-  local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-} storage=${7:-}
+  local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-} storage=${7:-} cpuset=${8:-}
   validate_user "$user"
   # sanitize ports numeric
   [[ "$ssh_port" =~ ^[0-9]+$ ]] || ssh_port=0
@@ -466,14 +479,14 @@ csv_upsert_user() {
   if [ -z "$password" ]; then
     password=$(gen_password)
   fi
-  echo "${user},${ssh_port},${web_port},${password},${cpus},${memory},${storage}" >> "$USERS_CSV"
+  echo "${user},${ssh_port},${web_port},${password},${cpus},${memory},${storage},${cpuset}" >> "$USERS_CSV"
   echo "$password"  # echo so caller can capture
 }
 
 add_user_service() {
-  local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-} storage=${7:-}
+  local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-} storage=${7:-} cpuset=${8:-}
   local pw
-  pw=$(csv_upsert_user "$user" "$ssh_port" "$web_port" "$password" "$cpus" "$memory" "$storage")
+  pw=$(csv_upsert_user "$user" "$ssh_port" "$web_port" "$password" "$cpus" "$memory" "$storage" "$cpuset")
   start_container "$user"
   echo "User $user added/updated. Password: $pw"
 }
@@ -573,7 +586,7 @@ case "${1:-}" in
     ;;
   add)
     [ -z "${2:-}" ] && { echo "Error: user required"; exit 1; }
-    add_user_service "$2" "${3:-0}" "${4:-0}" "${5:-}" "${6:-}" "${7:-}"
+    add_user_service "$2" "${3:-0}" "${4:-0}" "${5:-}" "${6:-}" "${7:-}" "${8:-}"
     ;;
   remove)
     [ -z "${2:-}" ] && { echo "Error: user required"; exit 1; }
