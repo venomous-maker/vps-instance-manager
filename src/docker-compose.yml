@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   # Template for user containers
-  ssh-container-template: &ssh-template
+  ssh-container-template:
     build: .
     restart: unless-stopped
     volumes:
@@ -18,8 +18,7 @@ services:
     networks:
       - user-network
 
-
-volumes:
+volumes: {}
 
 networks:
   user-network:
