@@ -1,21 +1,14 @@
-
 services:
-  # Template for user containers
-  ssh-container-template:
+  # Build-only service for the base SSH image. Do not run this service directly.
+  # Use ./manage_container.sh to generate per-user services in docker-compose.generated.yml
+  image-builder:
     build: .
-    restart: unless-stopped
-    volumes:
-      - ./shared:/shared:ro  # Read-only shared resources
-    environment:
-      - USERS=${USERS:-""}
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 22 || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 5s
-    networks:
-      - user-network
 
 volumes: {}
 

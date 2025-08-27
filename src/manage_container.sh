@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
 GEN_COMPOSE="$SCRIPT_DIR/docker-compose.generated.yml"
 USERS_CSV="$SCRIPT_DIR/users.csv"
 
@@ -41,6 +41,11 @@ validate_user() {
     echo "Error: invalid username '$u'. Allowed: alnum, dot, underscore, dash; must start with alnum; max 63 chars." >&2
     exit 1
   fi
+}
+
+# Print available usernames based on generated services
+print_available_users() {
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" config --services 2>/dev/null | sed 's/-ssh$//' | awk 'NF{print "  - "$0}' ) || true
 }
 
 show_help() {
@@ -103,34 +108,41 @@ generate_compose() {
   ensure_users_csv
   tmp_file=$(mktemp)
   {
+    echo "# This file is generated. Do not edit manually."
+    echo "# Source CSV: $(basename "$USERS_CSV")"
     echo "services:"
+    # Use distinct local variables to avoid clobbering outer scope
+    local u ssh_p web_p pass cpus_v mem_v
     # shellcheck disable=SC2162
-    while IFS=, read -r user ssh_port web_port password cpus memory; do
+    while IFS=, read -r u ssh_p web_p pass cpus_v mem_v; do
       # skip header or comments/blank
-      [ -z "${user:-}" ] && continue
-      case "$user" in \
+      [ -z "${u:-}" ] && continue
+      case "$u" in \
         \#*|user) continue;; \
       esac
-      user=$(sanitize_user "$user")
-      [ -z "$user" ] && continue
+      u=$(sanitize_user "$u")
+      [ -z "$u" ] && continue
       # defaults
-      ssh_port=${ssh_port:-0}
-      web_port=${web_port:-0}
-      password=${password:-}
-      cpus=${cpus:-}
-      memory=${memory:-}
-      [ -z "$password" ] && password=$(gen_password)
+      ssh_p=${ssh_p:-0}
+      web_p=${web_p:-0}
+      pass=${pass:-}
+      cpus_v=${cpus_v:-}
+      mem_v=${mem_v:-}
+      [ -z "$pass" ] && pass=$(gen_password)
       # service
-      echo "  ${user}-ssh:"
+      echo "  ${u}-ssh:"
       echo "    build: ."
-      echo "    container_name: ${user}-ssh"
-      echo "    hostname: ${user}-workspace"
+      echo "    container_name: ${u}-ssh"
+      echo "    hostname: ${u}-workspace"
       echo "    restart: unless-stopped"
+      echo "    labels:"
+      echo "      - managed-by=manage_container.sh"
+      echo "      - user=${u}"
       echo "    volumes:"
       echo "      - ./shared:/shared:ro"
-      echo "      - ${user}-data:/home"
+      echo "      - ${u}-data:/home"
       echo "    environment:"
-      echo "      - USERS=${user}:${password}"
+      echo "      - USERS=${u}:${pass}"
       echo "    healthcheck:"
       echo "      test: [\"CMD-SHELL\", \"nc -z localhost 22 || exit 1\"]"
       echo "      interval: 10s"
@@ -138,31 +150,40 @@ generate_compose() {
       echo "      retries: 5"
       echo "      start_period: 5s"
       echo "    networks: [ user-network ]"
-      if [ -n "$cpus" ] || [ -n "$memory" ]; then
+      # Resource limits
+      if [ -n "$cpus_v" ]; then
+        echo "    cpus: \"$cpus_v\""
+      fi
+      if [ -n "$mem_v" ]; then
+        echo "    mem_limit: \"$mem_v\""
+        echo "    mem_reservation: \"$mem_v\""
+      fi
+      if [ -n "$cpus_v" ] || [ -n "$mem_v" ]; then
         echo "    deploy:"
         echo "      resources:"
         echo "        limits:"
-        [ -n "$cpus" ] && echo "          cpus: \"$cpus\""
-        [ -n "$memory" ] && echo "          memory: \"$memory\""
+        [ -n "$cpus_v" ] && echo "          cpus: \"$cpus_v\""
+        [ -n "$mem_v" ] && echo "          memory: \"$mem_v\""
       fi
       echo "    ports:"
-      if [ "$ssh_port" != "0" ]; then
-        echo "      - \"${ssh_port}:22\""
+      if [ "$ssh_p" != "0" ]; then
+        echo "      - \"${ssh_p}:22\""
       fi
-      if [ "$web_port" != "0" ]; then
-        echo "      - \"${web_port}:8000\""
+      if [ "$web_p" != "0" ]; then
+        echo "      - \"${web_p}:8000\""
       fi
     done < "$USERS_CSV"
     echo "volumes:"
     # shellcheck disable=SC2162
-    while IFS=, read -r user ssh_port web_port password cpus memory; do
-      [ -z "${user:-}" ] && continue
-      case "$user" in \
+    local uv sv wv pv cv mv
+    while IFS=, read -r uv sv wv pv cv mv; do
+      [ -z "${uv:-}" ] && continue
+      case "$uv" in \
         \#*|user) continue;; \
       esac
-      user=$(sanitize_user "$user")
-      [ -z "$user" ] && continue
-      echo "  ${user}-data:"
+      uv=$(sanitize_user "$uv")
+      [ -z "$uv" ] && continue
+      echo "  ${uv}-data:"
     done < "$USERS_CSV"
     echo "networks:"
     echo "  user-network:"
@@ -245,6 +266,8 @@ open_shell() {
     svc=$(get_container_name "$user")
     if ! service_exists "$svc"; then
       echo "Error: service '$svc' not found in compose config (check username)." >&2
+      echo "Available users:" >&2
+      print_available_users >&2
       exit 1
     fi
     local cid
@@ -269,6 +292,8 @@ show_ssh_info() {
     svc=$(get_container_name "$user")
     if ! service_exists "$svc"; then
       echo "Error: service '$svc' not found in compose config" >&2
+      echo "Available users:" >&2
+      print_available_users >&2
       exit 1
     fi
     local cid
@@ -302,6 +327,7 @@ show_status() {
 }
 
 show_config() {
+  generate_compose
   ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" config --services | cat )
 }
 
@@ -312,16 +338,20 @@ doctor() {
   fi
   echo "== CSV (raw) =="
   sed -n '1,200p' "$USERS_CSV" | cat
-  echo "\n== Generated services =="
+  echo
+  echo "== Generated services =="
   ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" config --services | cat ) || true
   if [ -n "$user" ]; then
     local svc
     svc=$(get_container_name "$user")
-    echo "\nResolved service for '$user': $svc"
+    echo
+    echo "Resolved service for '$user': $svc"
     if service_exists "$svc"; then
       echo "Service exists in compose."
     else
       echo "Service NOT found in compose."
+      echo "Available users:"
+      print_available_users
     fi
     if file "$USERS_CSV" | grep -qi 'CRLF'; then
       echo "CSV has CRLF line endings; run: dos2unix '$USERS_CSV'" >&2

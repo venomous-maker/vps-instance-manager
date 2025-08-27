@@ -1,0 +1,39 @@
+# This file is generated. Do not edit manually.
+# Source CSV: users.csv
+services:
+  kingzenttechz-ssh:
+    build: .
+    container_name: kingzenttechz-ssh
+    hostname: kingzenttechz-workspace
+    restart: unless-stopped
+    labels:
+      - managed-by=manage_container.sh
+      - user=kingzenttechz
+    volumes:
+      - ./shared:/shared:ro
+      - kingzenttechz-data:/home
+    environment:
+      - USERS=kingzenttechz:password
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 22 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [ user-network ]
+    cpus: "2"
+    mem_limit: "2500m"
+    mem_reservation: "2500m"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "2500m"
+    ports:
+      - "2001:22"
+      - "8000:8000"
+volumes:
+  kingzenttechz-data:
+networks:
+  user-network:
+    driver: bridge
