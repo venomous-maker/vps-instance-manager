@@ -9,7 +9,6 @@ services:
     labels:
       - managed-by=manage_container.sh
       - user=kingzenttechz
-    security_opt: [ "no-new-privileges:true" ]
     tmpfs: [ "/tmp:rw,noexec,nosuid", "/run:rw", "/var/run:rw" ]
     volumes:
       - kingzenttechz-data:/home

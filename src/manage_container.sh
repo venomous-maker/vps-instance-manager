@@ -194,7 +194,7 @@ generate_compose() {
       echo "    labels:"
       echo "      - managed-by=manage_container.sh"
       echo "      - user=${u}"
-      echo "    security_opt: [ \"no-new-privileges:true\" ]"
+      # Removed no-new-privileges to allow sudo within the container
       echo "    tmpfs: [ \"/tmp:rw,noexec,nosuid\", \"/run:rw\", \"/var/run:rw\" ]"
       echo "    volumes:"
       if [ -n "$storage_v" ]; then
