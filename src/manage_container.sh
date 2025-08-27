@@ -97,7 +97,6 @@ generate_compose() {
   ensure_users_csv
   tmp_file=$(mktemp)
   {
-    echo "version: '3.8'"
     echo "services:"
     # shellcheck disable=SC2162
     while IFS=, read -r user ssh_port web_port password cpus memory; do
