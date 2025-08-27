@@ -66,6 +66,7 @@ Commands:
   stop <user>                       Stop a specific user's container
   restart <user>                    Restart a specific user's container
   recreate <user>                   Force-recreate a specific user's container with current config
+  resources <user>                  Show configured and runtime CPU/RAM limits for a user's container
   logs <user>                       Show logs for a user's container
   shell <user>                      Open shell in user's container
   ssh-info <user>                   Show SSH connection info for user
@@ -508,6 +509,61 @@ remove_user_service() {
   echo "Removed user $user service and data (if any)."
 }
 
+# Show configured and runtime resources for a user
+show_resources() {
+  local user=$1
+  validate_user "$user"
+  generate_compose
+  local svc cid
+  svc=$(get_container_name "$user")
+  if ! service_exists "$svc"; then
+    echo "Error: service '$svc' not found in compose config" >&2
+    exit 1
+  fi
+  # Config from CSV
+  local csv_cpus csv_mem
+  csv_cpus=$(awk -F, -v u="$user" 'BEGIN{IGNORECASE=1} $1==u{print $5; exit}' "$USERS_CSV" | tr -d '\r')
+  csv_mem=$(awk -F, -v u="$user" 'BEGIN{IGNORECASE=1} $1==u{print $6; exit}' "$USERS_CSV" | tr -d '\r')
+  [ -z "$csv_cpus" ] && csv_cpus="(not set)"
+  [ -z "$csv_mem" ] && csv_mem="(not set)"
+  echo "Configured (CSV):"
+  echo "  CPUs:   $csv_cpus"
+  echo "  Memory: $csv_mem"
+  # Runtime from docker inspect (if running)
+  cid=$(get_container_id "$svc")
+  if [ -z "$cid" ]; then
+    echo "Runtime: container not running. Start it to inspect actual limits."
+    return 0
+  fi
+  # Fetch NanoCpus, CpuQuota/Period, Memory, MemoryReservation
+  local nano quota period mem_bytes mem_resv cpuset
+  nano=$(docker inspect -f '{{.HostConfig.NanoCpus}}' "$cid" 2>/dev/null | tr -d '\r')
+  quota=$(docker inspect -f '{{.HostConfig.CpuQuota}}' "$cid" 2>/dev/null | tr -d '\r')
+  period=$(docker inspect -f '{{.HostConfig.CpuPeriod}}' "$cid" 2>/dev/null | tr -d '\r')
+  cpuset=$(docker inspect -f '{{.HostConfig.CpusetCpus}}' "$cid" 2>/dev/null | tr -d '\r')
+  mem_bytes=$(docker inspect -f '{{.HostConfig.Memory}}' "$cid" 2>/dev/null | tr -d '\r')
+  mem_resv=$(docker inspect -f '{{.HostConfig.MemoryReservation}}' "$cid" 2>/dev/null | tr -d '\r')
+  # Compute CPUs
+  local cpus_calc cps
+  if [ -n "$nano" ] && [ "$nano" -gt 0 ] 2>/dev/null; then
+    # NanoCPUs is in units of 1e-9 CPU
+    cpus_calc=$(awk -v n="$nano" 'BEGIN{printf "%.3f", n/1000000000}')
+  elif [ -n "$quota" ] && [ -n "$period" ] && [ "$period" -gt 0 ] 2>/dev/null; then
+    cpus_calc=$(awk -v q="$quota" -v p="$period" 'BEGIN{printf "%.3f", q/p}')
+  else
+    cpus_calc="(unlimited)"
+  fi
+  # Memory formatting
+  format_bytes() {
+    local b=$1
+    if [ -z "$b" ] || [ "$b" -le 0 ] 2>/dev/null; then echo "(unlimited)"; return; fi
+    awk -v b="$b" 'BEGIN{u[1]="B";u[2]="KiB";u[3]="MiB";u[4]="GiB";u[5]="TiB";i=1;while(b>=1024 && i<5){b/=1024;i++} printf "%.2f %s", b,u[i]}'
+  }
+  echo "Runtime (docker):"
+  echo "  CPUs:   ${cpus_calc}${cpuset:+ (cpuset=$cpuset)}"
+  echo "  Memory: $(format_bytes "$mem_bytes") (reservation: $(format_bytes "$mem_resv"))"
+}
+
 case "${1:-}" in
   generate)
     generate_compose
@@ -563,6 +619,10 @@ case "${1:-}" in
     ;;
   status)
     show_status
+    ;;
+  resources)
+    [ -z "${2:-}" ] && { echo "Error: user required"; exit 1; }
+    show_resources "$2"
     ;;
   help|--help|-h|"")
     show_help
