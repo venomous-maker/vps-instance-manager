@@ -29,6 +29,21 @@ gen_password() {
   fi
 }
 
+# Validate username for service/container naming
+validate_user() {
+  local u=${1:-}
+  if [ -z "$u" ]; then
+    echo "Error: username is required" >&2; exit 1
+  fi
+  case "$u" in
+    -*) echo "Error: username cannot start with '-'" >&2; exit 1;;
+  esac
+  if ! echo "$u" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$'; then
+    echo "Error: invalid username '$u'. Allowed: alnum, dot, underscore, dash; must start with alnum; max 63 chars." >&2
+    exit 1
+  fi
+}
+
 show_help() {
     cat << EOF
 Container Management Script (automated)
@@ -66,9 +81,10 @@ get_container_name() {
 
 get_ssh_port() {
     local user=$1
+    validate_user "$user"
     local container_name
     container_name=$(get_container_name "$user")
-    docker port "$container_name" 22 2>/dev/null | cut -d: -f2
+    docker port -- "$container_name" 22 2>/dev/null | cut -d: -f2
 }
 
 ensure_users_csv() {
@@ -145,35 +161,39 @@ compose_up_all() {
 
 start_container() {
     local user=$1
+    validate_user "$user"
     generate_compose
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" up -d "$(get_container_name "$user")" )
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" up -d -- "$(get_container_name "$user")" )
 }
 
 stop_container() {
     local user=$1
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" stop "$(get_container_name "$user")" )
+    validate_user "$user"
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" stop -- "$(get_container_name "$user")" )
 }
 
 restart_container() {
     local user=$1
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" restart "$(get_container_name "$user")" )
+    validate_user "$user"
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" restart -- "$(get_container_name "$user")" )
 }
 
 show_logs() {
     local user=$1
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" logs -f "$(get_container_name "$user")" )
+    validate_user "$user"
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" logs -f -- "$(get_container_name "$user")" )
 }
 
 open_shell() {
     local user=$1
+    validate_user "$user"
     echo "Opening shell in container for user: $user"
-    docker exec -it "$(get_container_name "$user")" /bin/bash
+    docker exec -it -- "$(get_container_name "$user")" /bin/bash
 }
 
 show_ssh_info() {
     local user=$1
-    local container_name
-    container_name=$(get_container_name "$user")
+    validate_user "$user"
     local ssh_port
     ssh_port=$(get_ssh_port "$user")
 
@@ -203,6 +223,7 @@ show_status() {
 csv_upsert_user() {
   ensure_users_csv
   local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-}
+  validate_user "$user"
   # sanitize ports numeric
   [[ "$ssh_port" =~ ^[0-9]+$ ]] || ssh_port=0
   [[ "$web_port" =~ ^[0-9]+$ ]] || web_port=0
@@ -228,10 +249,11 @@ add_user_service() {
 
 remove_user_service() {
   local user=$1
+  validate_user "$user"
   local cname
   cname=$(get_container_name "$user")
-  ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" stop "$cname" || true )
-  ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" rm -f "$cname" || true )
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" stop -- "$cname" || true )
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" rm -f -- "$cname" || true )
   docker volume rm "${user}-data" 2>/dev/null || true
   # remove from CSV
   if [ -f "$USERS_CSV" ]; then
