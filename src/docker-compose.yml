@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  # Template for user containers
+  ssh-container-template: &ssh-template
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./shared:/shared:ro  # Read-only shared resources
+    environment:
+      - USERS=${USERS:-""}
+    networks:
+      - user-network
+
+#  # User 1 Container
+#  user1-ssh:
+#    <<: *ssh-template
+#    container_name: user1-ssh
+#    hostname: user1-workspace
+#    ports:
+#      - "2201:22"  # SSH on port 2201
+#      - "8001:8000"  # Web service port
+#    volumes:
+#      - user1-data:/home
+#      - ./shared:/shared:ro
+#    environment:
+#      - USERS=user1:password123
+#
+#  # User 2 Container
+#  user2-ssh:
+#    <<: *ssh-template
+#    container_name: user2-ssh
+#    hostname: user2-workspace
+#    ports:
+#      - "2202:22"  # SSH on port 2202
+#      - "8002:8000"  # Web service port
+#    volumes:
+#      - user2-data:/home
+#      - ./shared:/shared:ro
+#    environment:
+#      - USERS=user2:password456
+#
+#  # User 3 Container
+#  user3-ssh:
+#    <<: *ssh-template
+#    container_name: user3-ssh
+#    hostname: user3-workspace
+#    ports:
+#      - "2203:22"  # SSH on port 2203
+#      - "8003:8000"  # Web service port
+#    volumes:
+#      - user3-data:/home
+#      - ./shared:/shared:ro
+#    environment:
+#      - USERS=user3:password789
+
+volumes:
+
+networks:
+  user-network:
+    driver: bridge
