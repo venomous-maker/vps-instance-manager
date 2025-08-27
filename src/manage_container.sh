@@ -61,7 +61,8 @@ Commands:
   logs <user>                       Show logs for a user's container
   shell <user>                      Open shell in user's container
   ssh-info <user>                   Show SSH connection info for user
-  config                            Show merged config services for debugging
+  config                            Show services from generated compose
+  doctor <user>                     Run diagnostics for a user (CSV/compose/service)
   list                              List all user containers
   status                            Show status of all containers
   help                              Show this help
@@ -122,6 +123,8 @@ generate_compose() {
       # service
       echo "  ${user}-ssh:"
       echo "    build: ."
+      echo "    container_name: ${user}-ssh"
+      echo "    hostname: ${user}-workspace"
       echo "    restart: unless-stopped"
       echo "    volumes:"
       echo "      - ./shared:/shared:ro"
@@ -259,6 +262,30 @@ show_config() {
   ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" config --services | cat )
 }
 
+doctor() {
+  local user=${1:-}
+  if [ -n "$user" ]; then
+    validate_user "$user"
+  fi
+  echo "== CSV (raw) =="
+  sed -n '1,200p' "$USERS_CSV" | cat
+  echo "\n== Generated services =="
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" config --services | cat ) || true
+  if [ -n "$user" ]; then
+    local svc
+    svc=$(get_container_name "$user")
+    echo "\nResolved service for '$user': $svc"
+    if service_exists "$svc"; then
+      echo "Service exists in compose."
+    else
+      echo "Service NOT found in compose."
+    fi
+    if file "$USERS_CSV" | grep -qi 'CRLF'; then
+      echo "CSV has CRLF line endings; run: dos2unix '$USERS_CSV'" >&2
+    fi
+  fi
+}
+
 csv_upsert_user() {
   ensure_users_csv
   local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-}
@@ -344,6 +371,10 @@ case "${1:-}" in
     ;;
   config)
     show_config
+    ;;
+  doctor)
+    [ -z "${2:-}" ] && { echo "Usage: $0 doctor <user>"; exit 1; }
+    doctor "$2"
     ;;
   list)
     list_containers
