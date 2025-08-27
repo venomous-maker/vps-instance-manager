@@ -182,6 +182,12 @@ service_exists() {
   ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" config --services | grep -Fx "$svc" >/dev/null 2>&1 )
 }
 
+# Return the container ID for a service (empty if not running)
+get_container_id() {
+  local svc=$1
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" ps -q "$svc" )
+}
+
 start_container() {
     local user=$1
     validate_user "$user"
@@ -201,6 +207,10 @@ stop_container() {
     validate_user "$user"
     local svc
     svc=$(get_container_name "$user")
+    if ! service_exists "$svc"; then
+      echo "Error: service '$svc' not found in compose config" >&2
+      exit 1
+    fi
     ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" stop -- "$svc" )
 }
 
@@ -209,6 +219,10 @@ restart_container() {
     validate_user "$user"
     local svc
     svc=$(get_container_name "$user")
+    if ! service_exists "$svc"; then
+      echo "Error: service '$svc' not found in compose config" >&2
+      exit 1
+    fi
     ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" restart -- "$svc" )
 }
 
@@ -217,6 +231,10 @@ show_logs() {
     validate_user "$user"
     local svc
     svc=$(get_container_name "$user")
+    if ! service_exists "$svc"; then
+      echo "Error: service '$svc' not found in compose config" >&2
+      exit 1
+    fi
     ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" logs -f -- "$svc" )
 }
 
@@ -225,15 +243,40 @@ open_shell() {
     validate_user "$user"
     local svc
     svc=$(get_container_name "$user")
+    if ! service_exists "$svc"; then
+      echo "Error: service '$svc' not found in compose config (check username)." >&2
+      exit 1
+    fi
+    local cid
+    cid=$(get_container_id "$svc")
+    if [ -z "$cid" ]; then
+      echo "Container for service '$svc' is not running. Starting it..."
+      ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d -- "$svc" )
+      cid=$(get_container_id "$svc")
+      if [ -z "$cid" ]; then
+        echo "Error: failed to start service '$svc'" >&2
+        exit 1
+      fi
+    fi
     echo "Opening shell in container for user: $user"
-    docker exec -it -- "$svc" /bin/bash
+    docker exec -it -- "$cid" /bin/bash
 }
 
 show_ssh_info() {
     local user=$1
     validate_user "$user"
-    local ssh_port
-    ssh_port=$(get_ssh_port "$user")
+    local svc
+    svc=$(get_container_name "$user")
+    if ! service_exists "$svc"; then
+      echo "Error: service '$svc' not found in compose config" >&2
+      exit 1
+    fi
+    local cid
+    cid=$(get_container_id "$svc")
+    local ssh_port=""
+    if [ -n "$cid" ]; then
+      ssh_port=$(docker port -- "$cid" 22 2>/dev/null | cut -d: -f2)
+    fi
 
     if [ -n "$ssh_port" ]; then
         echo "SSH Connection Info for $user:"
@@ -242,7 +285,7 @@ show_ssh_info() {
         echo "  Username: $user"
         echo "  Command: ssh -p $ssh_port $user@localhost"
     else
-        echo "Container for user $user is not running or doesn't exist"
+        echo "Container for user $user is not running or port not mapped; try: $0 start $user"
     fi
 }
 
