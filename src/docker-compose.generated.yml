@@ -9,13 +9,14 @@ services:
     labels:
       - managed-by=manage_container.sh
       - user=kingzenttechz
+    security_opt: [ "no-new-privileges:true" ]
+    tmpfs: [ "/tmp:rw,noexec,nosuid", "/run:rw", "/var/run:rw" ]
     volumes:
-      - ./shared:/shared:ro
       - kingzenttechz-data:/home
     environment:
       - USERS=kingzenttechz:password
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 22 || exit 1"]
+      test: ["CMD-SHELL", "pgrep -x sshd >/dev/null 2>&1"]
       interval: 10s
       timeout: 3s
       retries: 5

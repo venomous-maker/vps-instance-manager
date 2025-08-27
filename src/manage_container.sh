@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
 GEN_COMPOSE="$SCRIPT_DIR/docker-compose.generated.yml"
 USERS_CSV="$SCRIPT_DIR/users.csv"
+STORAGE_DIR="$SCRIPT_DIR/storage"
 
 # Detect compose command
 compose_cmd() {
@@ -35,7 +36,8 @@ validate_user() {
     echo "Error: username is required" >&2; exit 1
   fi
   case "$u" in
-    -*) echo "Error: username cannot start with '-'" >&2; exit 1;;
+    -*) echo "Error: username cannot start with '-'
+" >&2; exit 1;;
   esac
   if ! echo "$u" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$'; then
     echo "Error: invalid username '$u'. Allowed: alnum, dot, underscore, dash; must start with alnum; max 63 chars." >&2
@@ -57,12 +59,13 @@ Usage: $0 COMMAND [ARGS]
 Commands:
   generate                          Generate $GEN_COMPOSE from $USERS_CSV (self-contained)
   up                                Generate and start all defined user containers
-  add <user> [ssh web pass cpus mem]
+  add <user> [ssh web pass cpus mem storage]
                                     Add/update a user row in users.csv and up just that service
   remove <user>                     Stop and remove a user's service and volume; delete from users.csv
   start <user>                      Start a specific user's container
   stop <user>                       Stop a specific user's container
   restart <user>                    Restart a specific user's container
+  recreate <user>                   Force-recreate a specific user's container with current config
   logs <user>                       Show logs for a user's container
   shell <user>                      Open shell in user's container
   ssh-info <user>                   Show SSH connection info for user
@@ -73,10 +76,11 @@ Commands:
   help                              Show this help
 
 CSV format (backward compatible):
-  user,ssh_port,web_port,password,cpus,memory
+  user,ssh_port,web_port,password,cpus,memory,storage
   - cpus: number of CPU cores (e.g. 0.5, 1, 2)
   - memory: RAM limit (e.g. 512m, 1g)
-Example: alice,2222,8001,mysecret,1,512m
+  - storage: persistent home size (e.g. 5G, 20G). Creates a loopback ext4 volume mounted to /home
+Example: alice,2222,8001,mysecret,1,512m,10G
 EOF
 }
 
@@ -95,7 +99,7 @@ get_ssh_port() {
 
 ensure_users_csv() {
   if [ ! -f "$USERS_CSV" ]; then
-    echo "user,ssh_port,web_port,password,cpus,memory" > "$USERS_CSV"
+    echo "user,ssh_port,web_port,password,cpus,memory,storage" > "$USERS_CSV"
   fi
 }
 
@@ -104,6 +108,57 @@ sanitize_user() {
   echo "$1" | tr -d '\r' | sed -e 's/^\s\+//' -e 's/\s\+$//'
 }
 
+# Convert sizes like 10G/512M to bytes (best effort)
+size_to_bytes() {
+  local s="$1"
+  case "$s" in
+    *[!0-9mMgGkK]) echo 0; return;;
+  esac
+  local num unit
+  num=$(echo "$s" | sed -E 's/([0-9]+).*/\1/')
+  unit=$(echo "$s" | sed -E 's/[0-9]+(.*)/\1/' | tr '[:upper:]' '[:lower:]')
+  case "$unit" in
+    g|gb) echo $(( num * 1024 * 1024 * 1024 ));;
+    m|mb) echo $(( num * 1024 * 1024 ));;
+    k|kb) echo $(( num * 1024 ));;
+    "") echo "$num";;
+    *) echo 0;;
+  esac
+}
+
+# Ensure loopback-backed storage mounted at $STORAGE_DIR/<user>
+ensure_storage() {
+  local user=$1 size=${2:-}
+  [ -z "$size" ] && return 0
+  mkdir -p "$STORAGE_DIR"
+  local img="$STORAGE_DIR/${user}.img" mnt="$STORAGE_DIR/${user}"
+  local want_bytes cur_bytes
+  want_bytes=$(size_to_bytes "$size")
+  if [ "$want_bytes" -le 0 ]; then
+    echo "Warning: invalid storage size '$size' for user '$user'; skipping dedicated storage." >&2
+    return 0
+  fi
+  if [ ! -f "$img" ]; then
+    echo "Creating storage image for $user: $size"
+    truncate -s "$size" "$img"
+    mkfs.ext4 -F "$img" >/dev/null 2>&1
+  else
+    cur_bytes=$(stat -c%s "$img" 2>/dev/null || echo 0)
+    if [ "$cur_bytes" -lt "$want_bytes" ]; then
+      echo "Expanding storage image for $user to $size"
+      truncate -s "$size" "$img"
+      e2fsck -p -f "$img" >/dev/null 2>&1 || true
+      resize2fs -f "$img" >/dev/null 2>&1 || true
+    fi
+  fi
+  mkdir -p "$mnt"
+  # mount if not mounted
+  if ! mountpoint -q "$mnt"; then
+    mount -o loop,noatime,nodiratime "$img" "$mnt"
+  fi
+}
+
+# Generate compose from CSV
 generate_compose() {
   ensure_users_csv
   tmp_file=$(mktemp)
@@ -112,9 +167,9 @@ generate_compose() {
     echo "# Source CSV: $(basename "$USERS_CSV")"
     echo "services:"
     # Use distinct local variables to avoid clobbering outer scope
-    local u ssh_p web_p pass cpus_v mem_v
+    local u ssh_p web_p pass cpus_v mem_v storage_v
     # shellcheck disable=SC2162
-    while IFS=, read -r u ssh_p web_p pass cpus_v mem_v; do
+    while IFS=, read -r u ssh_p web_p pass cpus_v mem_v storage_v; do
       # skip header or comments/blank
       [ -z "${u:-}" ] && continue
       case "$u" in \
@@ -128,6 +183,7 @@ generate_compose() {
       pass=${pass:-}
       cpus_v=${cpus_v:-}
       mem_v=${mem_v:-}
+      storage_v=${storage_v:-}
       [ -z "$pass" ] && pass=$(gen_password)
       # service
       echo "  ${u}-ssh:"
@@ -138,13 +194,18 @@ generate_compose() {
       echo "    labels:"
       echo "      - managed-by=manage_container.sh"
       echo "      - user=${u}"
+      echo "    security_opt: [ \"no-new-privileges:true\" ]"
+      echo "    tmpfs: [ \"/tmp:rw,noexec,nosuid\", \"/run:rw\", \"/var/run:rw\" ]"
       echo "    volumes:"
-      echo "      - ./shared:/shared:ro"
-      echo "      - ${u}-data:/home"
+      if [ -n "$storage_v" ]; then
+        echo "      - ./storage/${u}:/home"
+      else
+        echo "      - ${u}-data:/home"
+      fi
       echo "    environment:"
       echo "      - USERS=${u}:${pass}"
       echo "    healthcheck:"
-      echo "      test: [\"CMD-SHELL\", \"nc -z localhost 22 || exit 1\"]"
+      echo "      test: [\"CMD-SHELL\", \"pgrep -x sshd >/dev/null 2>&1\"]"
       echo "      interval: 10s"
       echo "      timeout: 3s"
       echo "      retries: 5"
@@ -175,15 +236,18 @@ generate_compose() {
     done < "$USERS_CSV"
     echo "volumes:"
     # shellcheck disable=SC2162
-    local uv sv wv pv cv mv
-    while IFS=, read -r uv sv wv pv cv mv; do
+    local uv sv wv pv cv mv storv
+    while IFS=, read -r uv sv wv pv cv mv storv; do
       [ -z "${uv:-}" ] && continue
       case "$uv" in \
         \#*|user) continue;; \
       esac
       uv=$(sanitize_user "$uv")
       [ -z "$uv" ] && continue
-      echo "  ${uv}-data:"
+      # Only define named volume when storage not set
+      if [ -z "${storv:-}" ]; then
+        echo "  ${uv}-data:"
+      fi
     done < "$USERS_CSV"
     echo "networks:"
     echo "  user-network:"
@@ -195,6 +259,15 @@ generate_compose() {
 
 compose_up_all() {
   generate_compose
+  # Pre-mount storage for all users that specified it
+  local u ssh_p web_p pass cpus_v mem_v storage_v
+  while IFS=, read -r u ssh_p web_p pass cpus_v mem_v storage_v; do
+    [ -z "${u:-}" ] && continue
+    case "$u" in \#*|user) continue;; esac
+    u=$(sanitize_user "$u")
+    [ -z "$u" ] && continue
+    ensure_storage "$u" "${storage_v:-}"
+  done < "$USERS_CSV"
   ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d )
 }
 
@@ -213,6 +286,10 @@ start_container() {
     local user=$1
     validate_user "$user"
     generate_compose
+    # Mount storage if configured
+    local stor
+    stor=$(awk -F, -v u="$user" 'BEGIN{IGNORECASE=1} $1==u{print $7; exit}' "$USERS_CSV" | tr -d '\r' || true)
+    ensure_storage "$user" "$stor"
     local svc
     svc=$(get_container_name "$user")
     echo "Using service: $svc"
@@ -245,6 +322,20 @@ restart_container() {
       exit 1
     fi
     ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" restart -- "$svc" )
+}
+
+recreate_container() {
+    local user=$1
+    validate_user "$user"
+    generate_compose
+    local svc
+    svc=$(get_container_name "$user")
+    echo "Force-recreating service: $svc"
+    if ! service_exists "$svc"; then
+      echo "Error: service '$svc' not found in compose config" >&2
+      exit 1
+    fi
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d --force-recreate --no-deps -- "$svc" )
 }
 
 show_logs() {
@@ -361,7 +452,7 @@ doctor() {
 
 csv_upsert_user() {
   ensure_users_csv
-  local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-}
+  local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-} storage=${7:-}
   validate_user "$user"
   # sanitize ports numeric
   [[ "$ssh_port" =~ ^[0-9]+$ ]] || ssh_port=0
@@ -374,16 +465,28 @@ csv_upsert_user() {
   if [ -z "$password" ]; then
     password=$(gen_password)
   fi
-  echo "${user},${ssh_port},${web_port},${password},${cpus},${memory}" >> "$USERS_CSV"
+  echo "${user},${ssh_port},${web_port},${password},${cpus},${memory},${storage}" >> "$USERS_CSV"
   echo "$password"  # echo so caller can capture
 }
 
 add_user_service() {
-  local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-}
+  local user=$1 ssh_port=${2:-0} web_port=${3:-0} password=${4:-} cpus=${5:-} memory=${6:-} storage=${7:-}
   local pw
-  pw=$(csv_upsert_user "$user" "$ssh_port" "$web_port" "$password" "$cpus" "$memory")
+  pw=$(csv_upsert_user "$user" "$ssh_port" "$web_port" "$password" "$cpus" "$memory" "$storage")
   start_container "$user"
   echo "User $user added/updated. Password: $pw"
+}
+
+# Unmount and remove loopback storage for a user (if present)
+teardown_storage() {
+  local user=$1
+  local mnt="$STORAGE_DIR/${user}"
+  local img="$STORAGE_DIR/${user}.img"
+  if mountpoint -q "$mnt"; then
+    umount -l "$mnt" || true
+  fi
+  [ -d "$mnt" ] && rmdir "$mnt" 2>/dev/null || true
+  [ -f "$img" ] && rm -f "$img" || true
 }
 
 remove_user_service() {
@@ -394,6 +497,8 @@ remove_user_service() {
   ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" stop -- "$svc" || true )
   ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" rm -f -- "$svc" || true )
   docker volume rm "${user}-data" 2>/dev/null || true
+  # unmount and remove dedicated storage if present
+  teardown_storage "$user"
   # remove from CSV
   if [ -f "$USERS_CSV" ]; then
     tmp=$(mktemp); awk -F, -v u="$user" 'BEGIN{OFS=","} NR==1{print;next} $1!=u{print}' "$USERS_CSV" > "$tmp" && mv "$tmp" "$USERS_CSV"
@@ -429,6 +534,10 @@ case "${1:-}" in
   restart)
     [ -z "${2:-}" ] && { echo "Error: user required"; exit 1; }
     restart_container "$2"
+    ;;
+  recreate)
+    [ -z "${2:-}" ] && { echo "Error: user required"; exit 1; }
+    recreate_container "$2"
     ;;
   logs)
     [ -z "${2:-}" ] && { echo "Error: user required"; exit 1; }

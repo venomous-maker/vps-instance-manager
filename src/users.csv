@@ -1,5 +1,5 @@
 user,ssh_port,web_port,password,cpus,memory
 # examples (remove # to enable)
-# alice,2222,8001,alicePass123,1,512m
-# bob,2223,8002,,0.5,256m\
-kingzenttechz,2001,8000,password,2,2500m
+# alice,2222,8001,alicePass123,1,512m,10G
+# bob,2223,8002,,0.5,256m,10G\
+kingzenttechz,2001,8000,password,2,2500m,
