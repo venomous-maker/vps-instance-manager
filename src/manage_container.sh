@@ -4,7 +4,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_COMPOSE="$SCRIPT_DIR/docker-compose.yml"
 GEN_COMPOSE="$SCRIPT_DIR/docker-compose.generated.yml"
 USERS_CSV="$SCRIPT_DIR/users.csv"
 
@@ -51,7 +50,7 @@ Container Management Script (automated)
 Usage: $0 COMMAND [ARGS]
 
 Commands:
-  generate                          Generate $GEN_COMPOSE from $USERS_CSV
+  generate                          Generate $GEN_COMPOSE from $USERS_CSV (self-contained)
   up                                Generate and start all defined user containers
   add <user> [ssh web pass cpus mem]
                                     Add/update a user row in users.csv and up just that service
@@ -62,6 +61,7 @@ Commands:
   logs <user>                       Show logs for a user's container
   shell <user>                      Open shell in user's container
   ssh-info <user>                   Show SSH connection info for user
+  config                            Show merged config services for debugging
   list                              List all user containers
   status                            Show status of all containers
   help                              Show this help
@@ -93,6 +93,11 @@ ensure_users_csv() {
   fi
 }
 
+sanitize_user() {
+  # trim whitespace and CRs
+  echo "$1" | tr -d '\r' | sed -e 's/^\s\+//' -e 's/\s\+$//'
+}
+
 generate_compose() {
   ensure_users_csv
   tmp_file=$(mktemp)
@@ -105,6 +110,8 @@ generate_compose() {
       case "$user" in \
         \#*|user) continue;; \
       esac
+      user=$(sanitize_user "$user")
+      [ -z "$user" ] && continue
       # defaults
       ssh_port=${ssh_port:-0}
       web_port=${web_port:-0}
@@ -112,15 +119,22 @@ generate_compose() {
       cpus=${cpus:-}
       memory=${memory:-}
       [ -z "$password" ] && password=$(gen_password)
-      # write service
+      # service
       echo "  ${user}-ssh:"
-      echo "    extends:"
-      echo "      service: ssh-container-template"
-      echo "      file: $(basename "$BASE_COMPOSE")"
-      echo "    container_name: ${user}-ssh"
-      echo "    hostname: ${user}-workspace"
+      echo "    build: ."
+      echo "    restart: unless-stopped"
+      echo "    volumes:"
+      echo "      - ./shared:/shared:ro"
+      echo "      - ${user}-data:/home"
       echo "    environment:"
       echo "      - USERS=${user}:${password}"
+      echo "    healthcheck:"
+      echo "      test: [\"CMD-SHELL\", \"nc -z localhost 22 || exit 1\"]"
+      echo "      interval: 10s"
+      echo "      timeout: 3s"
+      echo "      retries: 5"
+      echo "      start_period: 5s"
+      echo "    networks: [ user-network ]"
       if [ -n "$cpus" ] || [ -n "$memory" ]; then
         echo "    deploy:"
         echo "      resources:"
@@ -135,19 +149,21 @@ generate_compose() {
       if [ "$web_port" != "0" ]; then
         echo "      - \"${web_port}:8000\""
       fi
-      echo "    volumes:"
-      echo "      - ${user}-data:/home"
     done < "$USERS_CSV"
     echo "volumes:"
-    # add volumes for each user
     # shellcheck disable=SC2162
     while IFS=, read -r user ssh_port web_port password cpus memory; do
       [ -z "${user:-}" ] && continue
       case "$user" in \
         \#*|user) continue;; \
       esac
+      user=$(sanitize_user "$user")
+      [ -z "$user" ] && continue
       echo "  ${user}-data:"
     done < "$USERS_CSV"
+    echo "networks:"
+    echo "  user-network:"
+    echo "    driver: bridge"
   } > "$tmp_file"
   mv "$tmp_file" "$GEN_COMPOSE"
   echo "Generated $GEN_COMPOSE"
@@ -155,39 +171,59 @@ generate_compose() {
 
 compose_up_all() {
   generate_compose
-  ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" up -d )
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d )
+}
+
+service_exists() {
+  local svc=$1
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" config --services | grep -Fx "$svc" >/dev/null 2>&1 )
 }
 
 start_container() {
     local user=$1
     validate_user "$user"
     generate_compose
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" up -d -- "$(get_container_name "$user")" )
+    local svc
+    svc=$(get_container_name "$user")
+    echo "Using service: $svc"
+    if ! service_exists "$svc"; then
+      echo "Error: service '$svc' not found in $GEN_COMPOSE. Check users.csv and regenerate." >&2
+      exit 1
+    fi
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" up -d -- "$svc" )
 }
 
 stop_container() {
     local user=$1
     validate_user "$user"
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" stop -- "$(get_container_name "$user")" )
+    local svc
+    svc=$(get_container_name "$user")
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" stop -- "$svc" )
 }
 
 restart_container() {
     local user=$1
     validate_user "$user"
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" restart -- "$(get_container_name "$user")" )
+    local svc
+    svc=$(get_container_name "$user")
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" restart -- "$svc" )
 }
 
 show_logs() {
     local user=$1
     validate_user "$user"
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" logs -f -- "$(get_container_name "$user")" )
+    local svc
+    svc=$(get_container_name "$user")
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" logs -f -- "$svc" )
 }
 
 open_shell() {
     local user=$1
     validate_user "$user"
+    local svc
+    svc=$(get_container_name "$user")
     echo "Opening shell in container for user: $user"
-    docker exec -it -- "$(get_container_name "$user")" /bin/bash
+    docker exec -it -- "$svc" /bin/bash
 }
 
 show_ssh_info() {
@@ -216,7 +252,11 @@ list_containers() {
 show_status() {
     echo "Container Status Overview:"
     echo "=========================="
-    ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" ps )
+    ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" ps )
+}
+
+show_config() {
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" config --services | cat )
 }
 
 csv_upsert_user() {
@@ -249,10 +289,10 @@ add_user_service() {
 remove_user_service() {
   local user=$1
   validate_user "$user"
-  local cname
-  cname=$(get_container_name "$user")
-  ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" stop -- "$cname" || true )
-  ( cd "$SCRIPT_DIR" && compose_cmd -f "$BASE_COMPOSE" -f "$GEN_COMPOSE" rm -f -- "$cname" || true )
+  local svc
+  svc=$(get_container_name "$user")
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" stop -- "$svc" || true )
+  ( cd "$SCRIPT_DIR" && compose_cmd -f "$GEN_COMPOSE" rm -f -- "$svc" || true )
   docker volume rm "${user}-data" 2>/dev/null || true
   # remove from CSV
   if [ -f "$USERS_CSV" ]; then
@@ -301,6 +341,9 @@ case "${1:-}" in
   ssh-info)
     [ -z "${2:-}" ] && { echo "Error: user required"; exit 1; }
     show_ssh_info "$2"
+    ;;
+  config)
+    show_config
     ;;
   list)
     list_containers
