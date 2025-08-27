@@ -1,0 +1,5 @@
+user,ssh_port,web_port,password
+# examples (remove # to enable)
+# alice,2222,8001,alicePass123
+# bob,2223,8002,
+
